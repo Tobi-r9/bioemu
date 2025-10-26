@@ -140,6 +140,70 @@ def get_score(
     return {"node_orientations": node_orientations_score, "pos": pos_score}
 
 
+def forward_euler(
+    *,
+    sdes: dict[str, SDE],
+    N: int,
+    eps_t: float,
+    max_t: float,
+    device: torch.device,
+    batch: Batch,
+    score_model: torch.nn.Module,
+    noise: float,
+) -> ChemGraph:
+    """Sample from prior and then denoise."""
+
+    batch = batch.to(device)
+    if isinstance(score_model, torch.nn.Module):
+        # permits unit-testing with dummy model
+        score_model = score_model.to(device)
+    assert isinstance(sdes["node_orientations"], torch.nn.Module)  # shut up mypy
+    sdes["node_orientations"] = sdes["node_orientations"].to(device)
+    batch = batch.replace(
+        pos=sdes["pos"].prior_sampling(batch.pos.shape, device=device),
+        node_orientations=sdes["node_orientations"].prior_sampling(
+            batch.node_orientations.shape, device=device
+        ),
+    )
+
+    ts_min = 0.0
+    ts_max = 1.0
+    timesteps = torch.linspace(eps_t, max_t, N, device=device)
+    dt = torch.tensor((max_t - eps_t) / (N - 1)).to(device)
+    fields = list(sdes.keys())
+    predictors = {
+        name: EulerMaruyamaPredictor(
+            corruption=sde, noise_weight=0.0, marginal_concentration_factor=1.0
+        )
+        for name, sde in sdes.items()
+    }
+    batch_size = batch.num_graphs
+
+    for i in range(N):
+        # Set the timestep
+        t = torch.full((batch_size,), timesteps[i], device=device)
+        t_next = t + dt  # dt is positive; t_next is slightly more noisy than t.
+
+        score = get_score(batch=batch, t=t, score_model=score_model, sdes=sdes)
+
+        # First-order denoising step from t to t_next.
+        drift = {}
+        for field in fields:
+            drift[field], _ = predictors[field].reverse_drift_and_diffusion(
+                x=batch[field], t=t, batch_idx=batch.batch, score=score[field]
+            )
+
+        for field in fields:
+            batch[field] = predictors[field].update_given_drift_and_diffusion(
+                x=batch[field],
+                dt=dt[0],
+                drift=drift[field],
+                diffusion=0.0,
+            )[0]
+
+    return batch
+
+
 def heun_denoiser(
     *,
     sdes: dict[str, SDE],
