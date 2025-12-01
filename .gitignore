@@ -132,3 +132,7 @@ cython_debug/
 *.pth
 *.pt
 
+# samples & data
+/protein_data
+/results
+/bash_scripts
