@@ -1,6 +1,6 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-from typing import cast
+from typing import cast, Callable
 
 import numpy as np
 import torch
@@ -9,7 +9,7 @@ from torch_geometric.data.batch import Batch
 from .chemgraph import ChemGraph
 from .sde_lib import SDE, CosineVPSDE
 from .so3_sde import SO3SDE, apply_rotvec_to_rotmat
-
+from .mew_utils import gaussian_kde_score_batched, align_points
 TwoBatches = tuple[Batch, Batch]
 
 
@@ -120,7 +120,11 @@ def get_score(
           This function converts the score model output to a score.
         t: Diffusion timestep. Shape [batch_size,]
     """
-    tmp = score_model(batch, t)
+    # Some models expect batched t shaped [num_graphs, 1]
+    tt = t.view(-1)
+    if tt.shape[0] == 1 and hasattr(batch, "num_graphs"):
+        tt = tt.expand(batch.num_graphs)
+    tmp = score_model(batch, tt)
     # Score is in axis angle representation [N,3] (vector is along axis of rotation, vector length
     # is rotation angle in radians).
     assert isinstance(sdes["node_orientations"], SO3SDE)
@@ -138,70 +142,6 @@ def get_score(
     pos_score = tmp["pos"] / pos_std
 
     return {"node_orientations": node_orientations_score, "pos": pos_score}
-
-
-def forward_euler(
-    *,
-    sdes: dict[str, SDE],
-    N: int,
-    eps_t: float,
-    max_t: float,
-    device: torch.device,
-    batch: Batch,
-    score_model: torch.nn.Module,
-    noise: float,
-) -> ChemGraph:
-    """Sample from prior and then denoise."""
-
-    batch = batch.to(device)
-    if isinstance(score_model, torch.nn.Module):
-        # permits unit-testing with dummy model
-        score_model = score_model.to(device)
-    assert isinstance(sdes["node_orientations"], torch.nn.Module)  # shut up mypy
-    sdes["node_orientations"] = sdes["node_orientations"].to(device)
-    batch = batch.replace(
-        pos=sdes["pos"].prior_sampling(batch.pos.shape, device=device),
-        node_orientations=sdes["node_orientations"].prior_sampling(
-            batch.node_orientations.shape, device=device
-        ),
-    )
-
-    ts_min = 0.0
-    ts_max = 1.0
-    timesteps = torch.linspace(eps_t, max_t, N, device=device)
-    dt = torch.tensor((max_t - eps_t) / (N - 1)).to(device)
-    fields = list(sdes.keys())
-    predictors = {
-        name: EulerMaruyamaPredictor(
-            corruption=sde, noise_weight=0.0, marginal_concentration_factor=1.0
-        )
-        for name, sde in sdes.items()
-    }
-    batch_size = batch.num_graphs
-
-    for i in range(N):
-        # Set the timestep
-        t = torch.full((batch_size,), timesteps[i], device=device)
-        t_next = t + dt  # dt is positive; t_next is slightly more noisy than t.
-
-        score = get_score(batch=batch, t=t, score_model=score_model, sdes=sdes)
-
-        # First-order denoising step from t to t_next.
-        drift = {}
-        for field in fields:
-            drift[field], _ = predictors[field].reverse_drift_and_diffusion(
-                x=batch[field], t=t, batch_idx=batch.batch, score=score[field]
-            )
-
-        for field in fields:
-            batch[field] = predictors[field].update_given_drift_and_diffusion(
-                x=batch[field],
-                dt=dt[0],
-                drift=drift[field],
-                diffusion=0.0,
-            )[0]
-
-    return batch
 
 
 def heun_denoiser(
@@ -479,3 +419,172 @@ def dpm_solver(
         batch = batch_next.replace(node_orientations=sample)
 
     return batch
+
+
+@torch.no_grad()
+def reverse_probability_flow_trajectory(
+    sdes: dict[str, SDE],
+    batch: ChemGraph,
+    score_model: torch.nn.Module,
+    N: int,
+    eps_t: float,
+    max_t: float,
+    device: torch.device,
+    method: str = "euler",
+    noise_weight: float = 0.0,
+    guiding_samples: dict[str, dict[float, torch.Tensor]] = {"pos": {}, "node_orientations": {}},
+    guiding_strength_func: Callable[[float], float] = lambda t: t,
+    bandwidth_func: Callable[[float], float] = lambda t: 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Reverse-time integration (probability flow ODE; noise_weight=0) from t=max_t to t=eps_t.
+    Returns trajectory of pos and node_orientations.
+    """
+    assert "pos" in sdes and "node_orientations" in sdes
+    pos_sde = sdes["pos"]
+    so3_sde = sdes["node_orientations"]
+
+    # Ensure pyg Batch
+    if not isinstance(batch, Batch):
+        batch = Batch.from_data_list([batch])
+    batch = batch.to(device)
+    if isinstance(score_model, torch.nn.Module):
+        score_model = score_model.to(device)
+    assert isinstance(so3_sde, torch.nn.Module)
+    so3_sde = so3_sde.to(device)
+
+    # Avoid singularities at t=1 for CosineVPSDE (beta -> inf)
+    max_t_eff = min(float(max_t), 1.0 - 1e-5)
+    timesteps = torch.linspace(max_t_eff, float(eps_t), N, device=device)
+    dt = -torch.tensor((max_t_eff - float(eps_t)) / (N - 1), device=device)
+
+    pos_traj = [batch.pos.clone().detach().cpu()]
+    node_traj = [batch.node_orientations.clone().detach().cpu()]
+    d = len(batch.sequence[0])
+    excess_work = {
+        "pos": torch.tensor(0.0, device=device),
+        "node_orientations": torch.tensor(0.0, device=device),
+    }
+    print(d)
+
+    predictors = {
+        name: EulerMaruyamaPredictor(corruption=sde, noise_weight=noise_weight, marginal_concentration_factor=1.0)
+        for name, sde in sdes.items()
+    }
+    for i in range(N - 1):
+        t = torch.full((batch.num_graphs,), timesteps[i], device=device)
+        score = get_score(batch=batch, sdes=sdes, score_model=score_model, t=t)
+
+        # Compute reverse drift terms
+        for field in ["pos", "node_orientations"]:
+            if guiding_samples[field] and field == "pos":
+                # find key which is the closest to t
+                closest_key = min(guiding_samples[field].keys(), key=lambda x: abs(x - timesteps[i]))
+                guiding_sample = guiding_samples[field][closest_key]
+                K, M = batch[field].shape[0] // d, guiding_sample.shape[0] // d
+                guiding_sample = align_points(batch[field], guiding_sample, sequence_length=d)
+                kde_score = gaussian_kde_score_batched(batch[field].view(K, -1), guiding_sample.view(K, M, -1), bandwidth_func(timesteps[i].item())).view(-1, 3)
+                guiding_score = guiding_strength_func(timesteps[i].item()) * kde_score
+                score[field] = score[field] + guiding_score
+            drift, diffusion = predictors[field].reverse_drift_and_diffusion(
+                x=batch[field], t=t, batch_idx=batch.batch, score=score[field]
+            )
+            if guiding_samples[field] and field == "pos":
+                w = diffusion / 2
+                work_norm = (w * guiding_score.view(-1, 3)**2).sum(dim=-1)
+                excess_work[field] = excess_work[field] + work_norm.mean()
+            if method == "euler":
+                batch[field] = predictors[field].update_given_drift_and_diffusion(
+                    x=batch[field], dt=dt, drift=drift, diffusion=diffusion
+                )[0]
+            elif method == "heun":
+                # Heun (deterministic): average drifts
+                x_pred = predictors[field].update_given_drift_and_diffusion(
+                    x=batch[field], dt=dt, drift=drift, diffusion=torch.tensor(0.0, device=device)
+                )[0]
+                drift2, _ = predictors[field].reverse_drift_and_diffusion(
+                    x=x_pred, t=t + dt, batch_idx=batch.batch, score=score[field]
+                )
+                avg_drift = 0.5 * (drift + drift2)
+                batch[field] = predictors[field].update_given_drift_and_diffusion(
+                    x=batch[field], dt=dt, drift=avg_drift, diffusion=torch.tensor(0.0, device=device)
+                )[0]
+            else:
+                raise ValueError("method must be 'euler' or 'heun'")
+
+        pos_traj.append(batch.pos.clone().detach().cpu())
+        node_traj.append(batch.node_orientations.clone().detach().cpu())
+
+    return torch.stack(pos_traj), torch.stack(node_traj), timesteps, excess_work
+
+
+@torch.no_grad()
+def forward_probability_flow_trajectory(
+    sdes: dict[str, SDE],
+    batch: ChemGraph,
+    score_model: torch.nn.Module,
+    N: int,
+    eps_t: float,
+    max_t: float,
+    device: torch.device,
+    method: str = "euler",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Deterministic forward-time probability flow ODE from t=eps_t to t=max_t.
+    Returns trajectory of pos and node_orientations.
+    """
+    assert "pos" in sdes and "node_orientations" in sdes
+    pos_sde = sdes["pos"]
+    so3_sde = sdes["node_orientations"]
+
+    if not isinstance(batch, Batch):
+        batch = Batch.from_data_list([batch])
+    batch = batch.to(device)
+    if isinstance(score_model, torch.nn.Module):
+        score_model = score_model.to(device)
+    assert isinstance(so3_sde, torch.nn.Module)
+    so3_sde = so3_sde.to(device)
+
+    max_t_eff = min(float(max_t), 1.0 - 1e-5)
+    eps_t_eff = max(float(eps_t), 1e-5)
+    timesteps = torch.linspace(eps_t_eff, max_t_eff, N, device=device)
+    dt = torch.tensor((max_t_eff - eps_t_eff) / (N - 1), device=device)
+
+    pos_traj = {timesteps[0].item(): batch.pos.clone()}
+    node_traj = {timesteps[0].item(): batch.node_orientations.clone()}
+
+    predictors = {
+        name: EulerMaruyamaPredictor(corruption=sde, noise_weight=0.0, marginal_concentration_factor=1.0)
+        for name, sde in sdes.items()
+    }
+
+    for i in range(N - 1):
+        t = torch.full((batch.num_graphs,), timesteps[i], device=device)
+        score = get_score(batch=batch, sdes=sdes, score_model=score_model, t=t)
+
+        for field in ["pos", "node_orientations"]:
+            drift, _ = predictors[field].reverse_drift_and_diffusion(
+                x=batch[field], t=t, batch_idx=batch.batch, score=score[field]
+            )
+            if method == "euler":
+                batch[field] = predictors[field].update_given_drift_and_diffusion(
+                    x=batch[field], dt=dt, drift=drift, diffusion=torch.tensor(0.0, device=device)
+                )[0]
+            elif method == "heun":
+                x_pred = predictors[field].update_given_drift_and_diffusion(
+                    x=batch[field], dt=dt, drift=drift, diffusion=torch.tensor(0.0, device=device)
+                )[0]
+                drift2, _ = predictors[field].reverse_drift_and_diffusion(
+                    x=x_pred, t=t + dt, batch_idx=batch.batch, score=score[field]
+                )
+                avg_drift = 0.5 * (drift + drift2)
+                batch[field] = predictors[field].update_given_drift_and_diffusion(
+                    x=batch[field], dt=dt, drift=avg_drift, diffusion=torch.tensor(0.0, device=device)
+                )[0]
+            else:
+                raise ValueError("method must be 'euler' or 'heun'")
+
+        pos_traj[timesteps[i+1].item()] = batch.pos.clone()
+        node_traj[timesteps[i+1].item()] = batch.node_orientations.clone()
+
+    return pos_traj, node_traj, timesteps
