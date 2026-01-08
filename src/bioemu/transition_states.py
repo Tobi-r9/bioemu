@@ -1,9 +1,122 @@
 # transition_classifier.py
 
 import numpy as np
+import torch
+from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
 from deeptime.markov.tools.analysis import committor
 # from bioemu.path_guidance import load_initial_structure
+
+
+# ---- Feature construction (mirrors visualise.py / tmp_2.py) ----------------- #
+
+PN_VECTOR = torch.tensor((-0.526, 1.363, 0.0), dtype=torch.float32)
+PC_VECTOR = torch.tensor((1.526, 0.0, 0.0), dtype=torch.float32)
+
+
+def compute_dihedral(p1, p2, p3, p4, eps: float = 1e-8):
+    """Signed dihedral (radians) between planes defined by consecutive triplets."""
+    b2 = p3 - p2
+    b2_norm = b2 / (b2.norm(dim=-1, keepdim=True) + eps)
+
+    v0 = p1 - p2
+    v1 = p4 - p3
+
+    v0p = v0 - (v0 * b2_norm).sum(dim=-1, keepdim=True) * b2_norm
+    v1p = v1 - (v1 * b2_norm).sum(dim=-1, keepdim=True) * b2_norm
+
+    x = (v0p * v1p).sum(dim=-1)
+    y = (torch.cross(b2_norm, v0p, dim=-1) * v1p).sum(dim=-1)
+    return torch.atan2(y, x)
+
+
+def compute_backbone_torsions(
+    positions: np.ndarray,
+    orientations: np.ndarray | None,
+    *,
+    device: torch.device,
+    pN: torch.Tensor = PN_VECTOR,
+    pC: torch.Tensor = PC_VECTOR,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute backbone φ/ψ torsion angles using CA positions and local frames."""
+    if orientations is None:
+        return np.empty((positions.shape[0], 0)), np.empty((positions.shape[0], 0))
+
+    ca = torch.as_tensor(positions, dtype=torch.float32, device=device)
+    Q = torch.as_tensor(orientations, dtype=torch.float32, device=device)
+
+    N = ca + torch.einsum("...ij,j->...i", Q, pN.to(device))
+    C = ca + torch.einsum("...ij,j->...i", Q, pC.to(device))
+    C_prev = torch.roll(C, shifts=1, dims=1)
+    N_next = torch.roll(N, shifts=-1, dims=1)
+
+    phi = compute_dihedral(C_prev, N, ca, C)
+    psi = compute_dihedral(N, ca, C, N_next)
+
+    phi = phi[:, 1:]
+    psi = psi[:, :-1]
+    return phi.detach().cpu().numpy(), psi.detach().cpu().numpy()
+
+
+def torsion_feature_matrix(
+    positions: np.ndarray,
+    orientations: np.ndarray | None,
+    *,
+    device: torch.device,
+) -> np.ndarray:
+    """Return sine/cosine encodings of backbone torsion angles."""
+    phi, psi = compute_backbone_torsions(positions, orientations, device=device)
+    blocks: list[np.ndarray] = []
+    if phi.size:
+        blocks.extend([np.sin(phi), np.cos(phi)])
+    if psi.size:
+        blocks.extend([np.sin(psi), np.cos(psi)])
+    if not blocks:
+        return np.empty((positions.shape[0], 0))
+    return np.hstack(blocks)
+
+
+def pairwise_distance_features(
+    positions: np.ndarray,
+    pair_indices: torch.Tensor | np.ndarray | None = None,
+    *,
+    scale_to_angstrom: bool = True,
+    device: torch.device,
+) -> tuple[np.ndarray, torch.Tensor]:
+    """Flattened CA–CA pairwise distances for every frame using the requested device."""
+    tensor = torch.as_tensor(positions, dtype=torch.float32, device=device)
+    batch, n_res, _ = tensor.shape
+
+    if pair_indices is None:
+        pair_indices = torch.triu_indices(n_res, n_res, offset=1, device=device)
+    elif isinstance(pair_indices, np.ndarray):
+        pair_indices = torch.as_tensor(pair_indices.T, dtype=torch.long, device=device)
+    else:
+        pair_indices = pair_indices.to(device)
+
+    diffs = tensor[:, pair_indices[0], :] - tensor[:, pair_indices[1], :]
+    distances = torch.linalg.norm(diffs, dim=-1)
+    if scale_to_angstrom:
+        distances = distances * 10.0
+    return distances.reshape(batch, -1).detach().cpu().numpy(), pair_indices.detach().cpu()
+
+
+def build_feature_matrix(
+    positions: np.ndarray,
+    orientations: np.ndarray | None,
+    pair_indices: torch.Tensor | np.ndarray,
+    *,
+    device: torch.device,
+) -> tuple[np.ndarray, torch.Tensor]:
+    """Concatenate distance and torsion-based features with consistent ordering."""
+    distances, pair_indices = pairwise_distance_features(
+        positions, pair_indices=pair_indices, device=device
+    )
+    torsions = torsion_feature_matrix(positions, orientations, device=device)
+    features = [distances]
+    if torsions.size:
+        features.append(torsions)
+    return np.hstack(features), pair_indices
 
 
 class TransitionClassifier:
@@ -13,6 +126,8 @@ class TransitionClassifier:
         npz_path: str,
         n_neighbors: int = 5,
         use_rotations: bool = True,
+        n_components: int = 2,
+        device: str | torch.device | None = None,
     ):
         """
         Parameters
@@ -23,10 +138,19 @@ class TransitionClassifier:
             k for k-NN (majority vote over nearest MD frames).
         use_rotations : bool
             If True, include rotation matrices in the feature vector.
+        n_components : int
+            Number of PCA components to retain for the embedding used by k-NN.
+        device : str or torch.device or None
+            Compute device for feature extraction (None -> cuda if available).
         """
         self.npz_path = npz_path
         self.n_neighbors = n_neighbors
         self.use_rotations = use_rotations
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+        self.n_components = n_components
 
         self._load_data()
         self._build_features()
@@ -45,21 +169,21 @@ class TransitionClassifier:
         self.n_states = self.T.shape[0]
 
     def _build_features(self):
-        pos_flat = self.ca_positions.reshape(self.n_frames, -1)
-
-        # TODO: Should rotations be used? This was not the case in the tito project.    
-        if self.use_rotations:
-            rot_flat = self.node_orientations.reshape(self.n_frames, -1)
-            features = np.concatenate([pos_flat, rot_flat], axis=1)
-        else:
-            features = pos_flat
-
-        # TODO: should we standardize the features?
-        self.feature_mean = features.mean(axis=0, keepdims=True)
-        self.feature_std = features.std(axis=0, keepdims=True)
-        self.feature_std[self.feature_std == 0.0] = 1.0
-
-        self.ref_features = (features - self.feature_mean) / self.feature_std
+        """Build reference feature matrix consistent with training pipeline."""
+        orientations = self.node_orientations if self.use_rotations else None
+        self.pair_indices = torch.triu_indices(
+            self.n_residues, self.n_residues, offset=1, device=self.device
+        )
+        ref_features, self.pair_indices = build_feature_matrix(
+            self.ca_positions,
+            orientations,
+            self.pair_indices,
+            device=self.device,
+        )
+        self.ref_features = ref_features
+        # Fit PCA on the same features used by the MSM/PCA workflow.
+        self.pca = PCA(n_components=self.n_components)
+        self.ref_pc = self.pca.fit_transform(ref_features)
 
     def _fit_knn(self):
         """
@@ -71,7 +195,7 @@ class TransitionClassifier:
             algorithm="auto",
             metric="euclidean",
         )
-        self.knn.fit(self.ref_features)
+        self.knn.fit(self.ref_pc)
 
     def _compute_committor_per_state(self):
         """
@@ -89,36 +213,26 @@ class TransitionClassifier:
 
 
     def _features_from_new_samples(self, new_ca, new_rot):
-        """
-        Build standardized feature vectors for new samples.
-
-        Parameters
-        ----------
-        new_ca : (b, n_res, 3)
-        new_rot : (b, n_res, 3, 3) or None
-
-        Returns
-        -------
-        features_std : (b, d)
-        """
+        """Build PCA-projected feature vectors for new samples."""
         if new_ca.shape[1] != self.n_residues:
             raise ValueError(
                 f"New samples have seq_len={new_ca.shape[1]}, "
                 f"but MSM model has n_residues={self.n_residues}."
             )
 
-        pos_flat = new_ca.reshape(new_ca.shape[0], -1)
-
+        orientations = None
         if self.use_rotations:
             if new_rot is None:
                 raise ValueError("Rotation matrices must be provided when use_rotations=True.")
-            rot_flat = new_rot.reshape(new_rot.shape[0], -1)
-            features = np.concatenate([pos_flat, rot_flat], axis=1)
-        else:
-            features = pos_flat
+            orientations = new_rot
 
-        features_std = (features - self.feature_mean) / self.feature_std
-        return features_std
+        features, _ = build_feature_matrix(
+            new_ca,
+            orientations,
+            self.pair_indices,
+            device=self.device,
+        )
+        return self.pca.transform(features)
 
     def classify(
         self,

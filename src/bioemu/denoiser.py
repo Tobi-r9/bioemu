@@ -9,7 +9,7 @@ from torch_geometric.data.batch import Batch
 from .chemgraph import ChemGraph
 from .sde_lib import SDE, CosineVPSDE
 from .so3_sde import SO3SDE, apply_rotvec_to_rotmat
-from .mew_utils import gaussian_kde_score_batched, align_points
+from .mew_utils import gaussian_kde_score_batched, align_points, so3_gaussian_kde_score_batched
 TwoBatches = tuple[Batch, Batch]
 
 
@@ -435,6 +435,8 @@ def reverse_probability_flow_trajectory(
     guiding_samples: dict[str, dict[float, torch.Tensor]] = {"pos": {}, "node_orientations": {}},
     guiding_strength_func: Callable[[float], float] = lambda t: t,
     bandwidth_func: Callable[[float], float] = lambda t: 1,
+    guiding_strength_rot_func: Callable[[float], float] = lambda t: t,
+    bandwidth_rot_func: Callable[[float], float] = lambda t: 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Reverse-time integration (probability flow ODE; noise_weight=0) from t=max_t to t=eps_t.
@@ -477,21 +479,38 @@ def reverse_probability_flow_trajectory(
 
         # Compute reverse drift terms
         for field in ["pos", "node_orientations"]:
-            if guiding_samples[field] and field == "pos":
-                # find key which is the closest to t
+            if guiding_samples[field]:
                 closest_key = min(guiding_samples[field].keys(), key=lambda x: abs(x - timesteps[i]))
-                guiding_sample = guiding_samples[field][closest_key]
-                K, M = batch[field].shape[0] // d, guiding_sample.shape[0] // d
-                guiding_sample = align_points(batch[field], guiding_sample, sequence_length=d)
-                kde_score = gaussian_kde_score_batched(batch[field].view(K, -1), guiding_sample.view(K, M, -1), bandwidth_func(timesteps[i].item())).view(-1, 3)
-                guiding_score = guiding_strength_func(timesteps[i].item()) * kde_score
-                score[field] = score[field] + guiding_score
+                guiding_sample = guiding_samples[field][closest_key].to(device)
+                if field == "pos":
+                    K, M = batch[field].shape[0] // d, guiding_sample.shape[0] // d
+                    guiding_sample = align_points(batch[field], guiding_sample, sequence_length=d)
+                    kde_score = gaussian_kde_score_batched(
+                        batch[field].view(K, -1),
+                        guiding_sample.view(K, M, -1),
+                        bandwidth_func(timesteps[i].item()),
+                    ).view(-1, 3)
+                    guiding_score = guiding_strength_func(timesteps[i].item()) * kde_score
+                    score[field] = score[field] + guiding_score
+                elif field == "node_orientations":
+                    kde_score_rot = so3_gaussian_kde_score_batched(
+                        R=batch[field],
+                        guiding_samples=guiding_sample,
+                        sequence_length=d,
+                        bandwidth=bandwidth_rot_func(timesteps[i].item()),
+                    )
+                    guiding_score_rot = guiding_strength_rot_func(timesteps[i].item()) * kde_score_rot
+                    score[field] = score[field] + guiding_score_rot
             drift, diffusion = predictors[field].reverse_drift_and_diffusion(
                 x=batch[field], t=t, batch_idx=batch.batch, score=score[field]
             )
             if guiding_samples[field] and field == "pos":
                 w = diffusion / 2
                 work_norm = (w * guiding_score.view(-1, 3)**2).sum(dim=-1)
+                excess_work[field] = excess_work[field] + work_norm.mean()
+            if guiding_samples[field] and field == "node_orientations":
+                w = diffusion / 2
+                work_norm = (w * guiding_score_rot**2).sum(dim=-1)
                 excess_work[field] = excess_work[field] + work_norm.mean()
             if method == "euler":
                 batch[field] = predictors[field].update_given_drift_and_diffusion(

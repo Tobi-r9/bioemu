@@ -1,4 +1,5 @@
 import torch
+from .so3_sde import rot_mult, rot_transpose, rotmat_to_rotvec
 
 @torch.no_grad()
 def kabsch_torch_batched(P: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
@@ -81,5 +82,46 @@ def gaussian_kde_score_batched(x: torch.Tensor, guiding_samples: torch.Tensor, b
     denominator = density.sum(dim=1, keepdim=True)
 
     return weighted_score / (denominator + eps) 
+
+
+@torch.no_grad()
+def so3_gaussian_kde_score_batched(
+    R: torch.Tensor,
+    guiding_samples: torch.Tensor,
+    sequence_length: int,
+    bandwidth: float = 1.0,
+    eps: float = 1e-20,
+) -> torch.Tensor:
+    """
+    KDE score on SO(3) using right-trivialized log map (R @ Exp(v)).
+    Args:
+        R: rotations of shape (N, 3, 3) where N = batch_size * sequence_length.
+        guiding_samples: guiding rotations of shape (M * sequence_length, 3, 3).
+        sequence_length: residues per graph (used to reshape).
+        bandwidth: scalar bandwidth σ_R(t).
+    Returns:
+        score: shape (N, 3) in the local tangent (so(3)) matching the model’s convention.
+    """
+    # Reshape into (B, L, 3, 3)
+    B = R.shape[0] // sequence_length
+    M = guiding_samples.shape[0] // sequence_length
+    R_batched = R.view(B, sequence_length, 3, 3)
+    G_batched = guiding_samples.view(M, sequence_length, 3, 3)
+
+    # Pairwise relative rotations: Log(R^{-1} * G) -> right-trivialized rotvecs
+    R_exp = R_batched[:, None]  # (B,1,L,3,3)
+    G_exp = G_batched[None, ...]  # (1,M,L,3,3)
+    rel = rot_mult(rot_transpose(R_exp), G_exp)  # (B,M,L,3,3)
+    rotvec = rotmat_to_rotvec(rel)  # (B,M,L,3)
+
+    # KDE weights
+    sq_norm = (rotvec**2).sum(dim=-1)  # (B,M,L)
+    density = torch.exp(-sq_norm / (2 * bandwidth**2))
+    denom = density.sum(dim=1, keepdim=True) + eps
+    weights = density / denom  # normalized over guiding samples M
+
+    # Score: sum_i w_i * rotvec_i / sigma^2
+    score = (weights[..., None] * rotvec).sum(dim=1) / (bandwidth**2)  # (B,L,3)
+    return score.reshape(B * sequence_length, 3)
 
 

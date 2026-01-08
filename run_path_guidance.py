@@ -18,6 +18,6 @@ path_guidance(
     save_dir="/lustre/groups/bauer/code/thoeppe/bioemu/results/",
     gamma=args.gamma,
     batch_size=args.batch_size,
-    use_rotations=False,
+    use_rotations=True,
     n_calls=args.n_calls,
 )

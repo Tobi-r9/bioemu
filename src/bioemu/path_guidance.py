@@ -18,7 +18,7 @@ from pathlib import Path
 
 import functools
 from skopt import gp_minimize
-from skopt.space import Real
+from skopt.space import Real, Integer, Categorical
 
 import os
 
@@ -29,6 +29,8 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+DATA_DIR = "/lustre/groups/bauer/code/thoeppe/bioemu/protein_data/transition_states"
 
 
 def run_gp_optimization(gamma, guiding_pos, guiding_rot, context, sdes, score_model, N, eps_t, max_t, method, device, sequence_length, batch_size, use_rotations, n_calls):
@@ -51,15 +53,23 @@ def run_gp_optimization(gamma, guiding_pos, guiding_rot, context, sdes, score_mo
         gamma=gamma,
         use_rotations=use_rotations,
     )
+
+    alpha_s_grid = [0.5 * i for i in range(1, 11)]
     result = gp_minimize(
         gp_optimization_function,
         [
-            Real(1, 5, name="alpha_s"),
-            Real(19, 20, name="kappa_s"),
+            Categorical(alpha_s_grid, name="alpha_s"),
+            Integer(5, 20, name="kappa_s"),
             Real(0.25, 0.75, name="beta_s"),
             Real(0.1, 1.5, name="alpha_b"),
-            Real(19, 20, name="kappa_b"),
+            Integer(5, 20, name="kappa_b"),
             Real(0.25, 0.75, name="beta_b"),
+            Categorical(alpha_s_grid, name="alpha_s_r"),
+            Integer(5, 20, name="kappa_s_r"),
+            Real(0.25, 0.75, name="beta_s_r"),
+            Real(0.1, 1.5, name="alpha_b_r"),
+            Integer(5, 20, name="kappa_b_r"),
+            Real(0.25, 0.75, name="beta_b_r"),
         ],
         # [
         #     Real(2.0, 3.0, name="alpha_s"),
@@ -113,10 +123,13 @@ def optimization_function(
     pos_rec = reshape_positions(sampled_positions[-1].detach().cpu(), batch_size, sequence_length)
     R_rec = reshape_orientations(sampled_orientations[-1].detach().cpu(), batch_size, sequence_length)
 
-    data_dir = "/lustre/groups/bauer/code/thoeppe/bioemu/protein_data/transition_states"
+    # cehck if tensor has nan or inf values
+    if torch.isnan(pos_rec).any() or torch.isinf(pos_rec).any() or torch.isnan(R_rec).any() or torch.isinf(R_rec).any():
+        print("nan or inf values in pos_rec or R_rec")
+        return 2
 
     transition_classifier = TransitionClassifier(
-        npz_path=data_dir + "/state_analysis_summary.npz",
+        npz_path=DATA_DIR + "/state_analysis_summary.npz",
         n_neighbors=1,
         use_rotations=use_rotations,
     )
@@ -124,11 +137,13 @@ def optimization_function(
     result = transition_classifier.classify(
         new_ca_positions=pos_rec,
         new_node_orientations=R_rec,
-        q_transition_low=0.45,
-        q_transition_high=0.55,
+        q_transition_low=0.4,
+        q_transition_high=0.6,
     )
     guiding_score = np.mean(result["is_transition"])
-    excess_work = gamma * (1 / N) * excess_work["pos"].item()
+    excess_work = gamma * (1 / N) * 0.5 * (excess_work["pos"].item() + excess_work["node_orientations"].item())
+    if not 0 < excess_work < 1:
+        excess_work = 1
     print(f"guiding_score: {guiding_score}, excess_work: {excess_work}")
     return (1 - guiding_score) + excess_work
 
@@ -200,6 +215,13 @@ def main(
         n_calls=n_calls,
     )
 
+    save_dir = f"{save_dir}/{gamma}_{batch_size}_{N}_{eps_t}_{max_t}_{method}_{use_rotations}"
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+    # save result.x to txt file
+    with open(f"{save_dir}/params.txt", "w") as f:
+        f.write(str(result.x))
+
     sampled_positions, sampled_orientations, t_b, excess_work = guided_reverse_integration(
         guiding_positions=guiding_pos,
         guiding_orientations=guiding_rot,
@@ -215,18 +237,33 @@ def main(
         batch_size=batch_size,
         params=result.x,
     )
-    save_dir = f"{save_dir}/{gamma}_{batch_size}_{N}_{eps_t}_{max_t}_{method}_{use_rotations}"
-    Path(save_dir).mkdir(parents=True, exist_ok=True)
+
     np.savez(
         f"{save_dir}/samples.npz",
         pos=sampled_positions[-1].detach().cpu().numpy(),
         node_orientations=sampled_orientations[-1].detach().cpu().numpy(),
     )
 
-    # save result.x to txt file
-    with open(f"{save_dir}/params.txt", "w") as f:
-        f.write(str(result.x))
+    transition_classifier = TransitionClassifier(
+        npz_path=DATA_DIR + "/state_analysis_summary.npz",
+        n_neighbors=1,
+        use_rotations=use_rotations,
+    )
 
+    pos_rec = reshape_positions(sampled_positions[-1].detach().cpu(), batch_size, sequence_length)
+    R_rec = reshape_orientations(sampled_orientations[-1].detach().cpu(), batch_size, sequence_length)
+
+    result = transition_classifier.classify(
+        new_ca_positions=pos_rec,
+        new_node_orientations=R_rec,
+        q_transition_low=0.4,
+        q_transition_high=0.6,
+    )
+    guiding_score = np.mean(result["is_transition"])
+
+    # save result to txt file
+    with open(f"{save_dir}/transition_classifier_result.txt", "w") as f:
+        f.write(str(guiding_score))
 
 
 if __name__ == "__main__":

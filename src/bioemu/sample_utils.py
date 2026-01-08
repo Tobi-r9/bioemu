@@ -121,7 +121,20 @@ def guided_reverse_integration(
     context: ChemGraph,
     sdes: dict[str, torch.nn.Module],
     score_model: torch.nn.Module,
-    params: tuple[float, float, float, float, float, float],
+    params: tuple[
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+    ],
     N: int = 200,
     eps_t: float = 1e-3,
     max_t: float = 1.0,
@@ -136,10 +149,27 @@ def guided_reverse_integration(
     pos_forward = sdes["pos"].prior_sampling((batch_size, sequence_length, 3), device=device)
     rot_forward = sdes["node_orientations"].prior_sampling((batch_size, sequence_length, 3, 3), device=device)
 
-    alpha_s, kappa_s, beta_s, alpha_b, kappa_b, beta_b = (torch.tensor(p) for p in params)
+    if len(params) != 12:
+        raise ValueError("params must contain 12 floats: 6 for pos, 6 for rotations.")
+    (
+        alpha_s,
+        kappa_s,
+        beta_s,
+        alpha_b,
+        kappa_b,
+        beta_b,
+        alpha_s_r,
+        kappa_s_r,
+        beta_s_r,
+        alpha_b_r,
+        kappa_b_r,
+        beta_b_r,
+    ) = (torch.tensor(p) for p in params)
 
     guiding_strength_func = lambda t: alpha_s * (1 - torch.sigmoid(kappa_s * (t - beta_s)))
     bandwidth_func = lambda t: alpha_b + (torch.sigmoid(kappa_b * (t - beta_b)))
+    guiding_strength_rot_func = lambda t: alpha_s_r * (1 - torch.sigmoid(kappa_s_r * (t - beta_s_r)))
+    bandwidth_rot_func = lambda t: alpha_b_r + (torch.sigmoid(kappa_b_r * (t - beta_b_r)))
 
     batch_f = build_batch_from_arrays(context, pos_forward, rot_forward)
     sampled_positions, sampled_orientations, t_b, excess_work = reverse_probability_flow_trajectory(
@@ -155,6 +185,8 @@ def guided_reverse_integration(
         noise_weight=1.0,
         guiding_strength_func=guiding_strength_func,
         bandwidth_func=bandwidth_func,
+        guiding_strength_rot_func=guiding_strength_rot_func,
+        bandwidth_rot_func=bandwidth_rot_func,
     )
 
     return sampled_positions, sampled_orientations, t_b, excess_work
