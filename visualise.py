@@ -159,7 +159,8 @@ def project_samples(
         reference_positions, reference_orientations, pair_indices, device=device
     )
     scaler = StandardScaler()
-    ref_features_scaled = scaler.fit_transform(ref_features)
+    # apparently we should not use this
+    # ref_features_scaled = scaler.fit_transform(ref_features)
 
     pca = PCA(n_components=n_components)
     # ref_pc = pca.fit_transform(ref_features_scaled)
@@ -194,6 +195,8 @@ def plot_embedding(
         labels = list(macro_labels) if macro_labels is not None else [f"macro {i}" for i in unique]
         for macro in unique:
             mask = macro_assignments == macro
+            # print percentage of frames in this macrostate
+            print(f"Percentage of frames in macrostate {macro}: {np.sum(mask) / len(macro_assignments) * 100:.2f}%")
             label = labels[int(macro)] if int(macro) < len(labels) else f"macro {macro}"
             ax.scatter(
                 embedding.reference_pc[mask, 0],
@@ -234,7 +237,7 @@ def plot_embedding(
     ax.grid(alpha=0.2, linewidth=0.5)
 
     if output_path is not None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        # output_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(output_path, dpi=300, bbox_inches="tight")
         print(f"Saved PCA scatter to {output_path}")
     else:
@@ -310,7 +313,7 @@ def main():
         help="Path to samples.npz produced by path_guidance.py.",
     )
     parser.add_argument(
-        "--save-path",
+        "--save_path",
         type=Path,
         default=None,
         help="Optional output path for the PCA scatter plot (PNG).",
@@ -371,11 +374,18 @@ def main():
         macros = ref_npz.get("macrostate_assignment_per_frame")
         macro_labels = ref_npz.get("macrostate_labels")
 
+    if args.save_path is None:
+        save_path = sample_path.parent
+    else:
+        save_path = Path(args.save_path)
+        save_path.mkdir(parents=True, exist_ok=True)
+    save_path = save_path / "visualisation.png"
+
     plot_embedding(
         embedding=embedding,
         macro_assignments=macros,
         macro_labels=macro_labels,
-        output_path=args.save_path if args.save_path is None else Path(args.save_path),
+        output_path=save_path,
         title=args.title,
     )
 
