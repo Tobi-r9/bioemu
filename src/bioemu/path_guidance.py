@@ -30,10 +30,15 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
-DATA_DIR = "/lustre/groups/bauer/code/thoeppe/bioemu/protein_data/transition_states"
+
+DATA_DIR = Path("/lustre/groups/bauer/code/thoeppe/bioemu/protein_data")
 
 
-def run_gp_optimization(gamma, guiding_pos, guiding_rot, context, sdes, score_model, N, eps_t, max_t, method, device, sequence_length, batch_size, use_rotations, n_calls):
+def run_gp_optimization(gamma, guiding_pos, guiding_rot, context, sdes, score_model, N, eps_t, max_t, method, device, sequence_length, batch_size, n_calls):
+
+    transition_classifier = TransitionClassifier(
+        npz_path=DATA_DIR / "feats_ref" / "feat_ref.npz",
+    )
 
     print("start optimization")
     gp_optimization_function = functools.partial(
@@ -51,7 +56,7 @@ def run_gp_optimization(gamma, guiding_pos, guiding_rot, context, sdes, score_mo
         sequence_length=sequence_length,
         batch_size=batch_size,
         gamma=gamma,
-        use_rotations=use_rotations,
+        transition_classifier=transition_classifier,
     )
 
     alpha_s_grid = [0.5 * i for i in range(1, 11)]
@@ -100,7 +105,7 @@ def optimization_function(
     sequence_length,
     batch_size,
     gamma,
-    use_rotations=False,
+    transition_classifier,
 ):
 
     # Reverse PF-ODE
@@ -123,22 +128,16 @@ def optimization_function(
     pos_rec = reshape_positions(sampled_positions[-1].detach().cpu(), batch_size, sequence_length)
     R_rec = reshape_orientations(sampled_orientations[-1].detach().cpu(), batch_size, sequence_length)
 
+    print(pos_rec.shape, R_rec.shape)
+
     # cehck if tensor has nan or inf values
     if torch.isnan(pos_rec).any() or torch.isinf(pos_rec).any() or torch.isnan(R_rec).any() or torch.isinf(R_rec).any():
         print("nan or inf values in pos_rec or R_rec")
         return 2
 
-    transition_classifier = TransitionClassifier(
-        npz_path=DATA_DIR + "/state_analysis_summary.npz",
-        n_neighbors=1,
-        use_rotations=use_rotations,
-    )
-
     result = transition_classifier.classify(
         new_ca_positions=pos_rec,
         new_node_orientations=R_rec,
-        q_transition_low=0.4,
-        q_transition_high=0.6,
     )
     guiding_score = np.mean(result["is_transition"])
     excess_work = gamma * (1 / N) * 0.5 * (excess_work["pos"].item() + excess_work["node_orientations"].item())
@@ -161,7 +160,6 @@ def main(
     ckpt_path: str | Path | None = None,
     model_config_path: str | Path | None = None,
     cache_so3_dir: str | Path | None = None,
-    use_rotations: bool = False,
     n_calls: int = 10,
     gamma: float = 1.0,
     save_dir: str | Path = "path_guidance_samples",
@@ -172,6 +170,8 @@ def main(
     - Reverse PF-ODE from max_t -> eps_t
     Then compare to initial structure.
     """
+
+    print(f"Start path guidance with gamma={gamma} batch_size={batch_size} N={N} eps_t={eps_t} max_t={max_t} method={method}")
     pos0, R0, sequence = load_initial_structure(init_npz, sequence)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     sequence_length = len(sequence)
@@ -211,11 +211,10 @@ def main(
         device=device,
         sequence_length=sequence_length,
         batch_size=batch_size,
-        use_rotations=use_rotations,
         n_calls=n_calls,
     )
 
-    save_dir = f"{save_dir}/{gamma}_{batch_size}_{N}_{eps_t}_{max_t}_{method}_{use_rotations}"
+    save_dir = f"{save_dir}/{gamma}_{batch_size}_{N}_{eps_t}_{max_t}_{method}_{n_calls}"
     Path(save_dir).mkdir(parents=True, exist_ok=True)
 
     # save result.x to txt file
@@ -234,7 +233,7 @@ def main(
         method=method,
         device=device,
         sequence_length=sequence_length,
-        batch_size=batch_size,
+        batch_size=1000,
         params=result.x,
     )
 
@@ -245,19 +244,15 @@ def main(
     )
 
     transition_classifier = TransitionClassifier(
-        npz_path=DATA_DIR + "/state_analysis_summary.npz",
-        n_neighbors=1,
-        use_rotations=use_rotations,
+        npz_path=DATA_DIR / "feats_ref" / "feat_ref.npz",
     )
 
-    pos_rec = reshape_positions(sampled_positions[-1].detach().cpu(), batch_size, sequence_length)
-    R_rec = reshape_orientations(sampled_orientations[-1].detach().cpu(), batch_size, sequence_length)
+    pos_rec = reshape_positions(sampled_positions[-1].detach().cpu(), 1000, sequence_length)
+    R_rec = reshape_orientations(sampled_orientations[-1].detach().cpu(), 1000, sequence_length)
 
     result = transition_classifier.classify(
         new_ca_positions=pos_rec,
         new_node_orientations=R_rec,
-        q_transition_low=0.4,
-        q_transition_high=0.6,
     )
     guiding_score = np.mean(result["is_transition"])
 

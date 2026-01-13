@@ -9,7 +9,7 @@ parser.add_argument("--batch_size", type=int, default=100)
 args = parser.parse_args()
 
 path_guidance(
-    sequence="/lustre/groups/bauer/code/thoeppe/bioemu/protein_data/transition_states/msa.a3m",
+    sequence="/lustre/groups/bauer/code/thoeppe/bioemu/protein_data/protein_check/protein_g.a3m",
     init_npz="/lustre/groups/bauer/code/thoeppe/bioemu/protein_data/transition_states/transition_states_positions_orientations.npz",
     N=args.N,
     eps_t=1e-3,
@@ -18,6 +18,5 @@ path_guidance(
     save_dir="/lustre/groups/bauer/code/thoeppe/bioemu/results/",
     gamma=args.gamma,
     batch_size=args.batch_size,
-    use_rotations=True,
     n_calls=args.n_calls,
 )

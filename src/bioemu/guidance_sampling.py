@@ -183,12 +183,6 @@ def main(
         params=params,
     )
 
-    np.savez(
-        f"{results_dir}/batch_{N}_{batch_size}.npz",
-        pos=sampled_positions[-1].detach().cpu().numpy(),
-        node_orientations=sampled_orientations[-1].detach().cpu().numpy(),
-    )
-
     pos_rec = reshape_positions(sampled_positions[-1].detach().cpu(), batch_size, n)
     R_rec = reshape_orientations(sampled_orientations[-1].detach().cpu(), batch_size, n)
 
@@ -212,6 +206,13 @@ def main(
     print("transition-like indices:", np.where(result["is_transition"])[0])
     print("macrostate labels:", result["macrostate_from_state"])
     print("percentage of transition-like states:", np.mean(result["is_transition"]))
+
+    np.savez(
+        f"{results_dir}/batch_{N}_{batch_size}.npz",
+        pos=sampled_positions[-1].detach().cpu().numpy(),
+        node_orientations=sampled_orientations[-1].detach().cpu().numpy(),
+        macrostate_labels=result["macrostate_from_state"],
+    )
 
     # Compute and report mean Wasserstein distance between bond length distributions
     # only compute for data with macrostate label 2
